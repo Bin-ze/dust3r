@@ -19,7 +19,7 @@ class PointCloudOptimizer(BasePCOptimizer):
     Graph edges: observations = (pred1, pred2)
     """
 
-    def __init__(self, *args, optimize_pp=False, focal_break=20, **kwargs):
+    def __init__(self, *args, optimize_pp=False, focal_break=20, focal_adjustment=True, **kwargs):
         super().__init__(*args, **kwargs)
 
         self.has_im_poses = True  # by definition of this class
@@ -28,8 +28,16 @@ class PointCloudOptimizer(BasePCOptimizer):
         # adding thing to optimize
         self.im_depthmaps = nn.ParameterList(torch.randn(H, W)/10-3 for H, W in self.imshapes)  # log(depth)
         self.im_poses = nn.ParameterList(self.rand_pose(self.POSE_DIM) for _ in range(self.n_imgs))  # camera poses
-        self.im_focals = nn.ParameterList(torch.FloatTensor(
-            [self.focal_break*np.log(max(H, W))]) for H, W in self.imshapes)  # camera intrinsics
+        if focal_adjustment:
+            self.im_focals = nn.ParameterList(torch.FloatTensor(
+                [self.focal_break*np.log(max(H, W))]) for H, W in self.imshapes)  # camera intrinsics
+            self.im_focals = ParameterStack(self.im_focals, is_param=True)
+        else:
+            self.im_focals = nn.ParameterList(torch.FloatTensor(
+                [self.focal_break*np.log(max(H, W))]) for H, W in self.imshapes)      #.to('cuda')  # camera intrinsics
+            self.im_focals.requires_grad_(focal_adjustment)
+            self.im_focals = ParameterStack(self.im_focals, is_param=True)
+            
         self.im_pp = nn.ParameterList(torch.zeros((2,)) for _ in range(self.n_imgs))  # camera intrinsics
         self.im_pp.requires_grad_(optimize_pp)
 
@@ -40,7 +48,7 @@ class PointCloudOptimizer(BasePCOptimizer):
         # adding thing to optimize
         self.im_depthmaps = ParameterStack(self.im_depthmaps, is_param=True, fill=self.max_area)
         self.im_poses = ParameterStack(self.im_poses, is_param=True)
-        self.im_focals = ParameterStack(self.im_focals, is_param=True)
+        # self.im_focals = ParameterStack(self.im_focals, is_param=True)
         self.im_pp = ParameterStack(self.im_pp, is_param=True)
         self.register_buffer('_pp', torch.tensor([(w/2, h/2) for h, w in self.imshapes]))
         self.register_buffer('_grid', ParameterStack(
@@ -80,6 +88,9 @@ class PointCloudOptimizer(BasePCOptimizer):
         self.im_poses.requires_grad_(False)
         self.norm_pw_scale = False
 
+    def im_poses_adjustment(self):
+        self.im_poses.requires_grad_(True)
+
     def preset_focal(self, known_focals, msk=None):
         self._check_all_imgs_are_selected(msk)
 
@@ -118,7 +129,7 @@ class PointCloudOptimizer(BasePCOptimizer):
     def _no_grad(self, tensor):
         assert tensor.requires_grad, 'it must be True at this point, otherwise no modification occurs'
 
-    def _set_focal(self, idx, focal, force=False):
+    def _set_focal(self, idx, focal, force=True):
         param = self.im_focals[idx]
         if param.requires_grad or force:  # can only init a parameter not already initialized
             param.data[:] = self.focal_break * np.log(focal)
@@ -186,15 +197,16 @@ class PointCloudOptimizer(BasePCOptimizer):
         return res
 
     def forward(self):
-        pw_poses = self.get_pw_poses()  # cam-to-world
-        pw_adapt = self.get_adaptors().unsqueeze(1)
-        proj_pts3d = self.get_pts3d(raw=True)
+        pw_poses = self.get_pw_poses()  # cam-to-world torch.Size([6, 4, 4])
+        pw_adapt = self.get_adaptors().unsqueeze(1) # torch.Size([6, 4, 4])
+        proj_pts3d = self.get_pts3d(raw=True)  # torch.Size([2, 262144, 3])
 
         # rotate pairwise prediction according to pw_poses
-        aligned_pred_i = geotrf(pw_poses, pw_adapt * self._stacked_pred_i)
-        aligned_pred_j = geotrf(pw_poses, pw_adapt * self._stacked_pred_j)
+        aligned_pred_i = geotrf(pw_poses, pw_adapt * self._stacked_pred_i) # torch.Size([6, 262144, 3])
+        aligned_pred_j = geotrf(pw_poses, pw_adapt * self._stacked_pred_j) # torch.Size([6, 262144, 3])
 
         # compute the less
+        # 优化一组旋转使得应用该组变换之后可以与之前的预测很好的对齐：此时找到的变换阵即为场景对齐的变换
         li = self.dist(proj_pts3d[self._ei], aligned_pred_i, weight=self._weight_i).sum() / self.total_area_i
         lj = self.dist(proj_pts3d[self._ej], aligned_pred_j, weight=self._weight_j).sum() / self.total_area_j
 

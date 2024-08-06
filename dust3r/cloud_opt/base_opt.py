@@ -5,7 +5,8 @@
 # Base class for the global alignement procedure
 # --------------------------------------------------------
 from copy import deepcopy
-
+import os
+import uuid
 import numpy as np
 import torch
 import torch.nn as nn
@@ -79,8 +80,6 @@ class BasePCOptimizer (nn.Module):
         self.conf_i = NoGradParamDict({ij: pred1_conf[n] for n, ij in enumerate(self.str_edges)})
         self.conf_j = NoGradParamDict({ij: pred2_conf[n] for n, ij in enumerate(self.str_edges)})
         self.im_conf = self._compute_img_conf(pred1_conf, pred2_conf)
-        for i in range(len(self.im_conf)):
-            self.im_conf[i].requires_grad = False
 
         # pairwise pose parameters
         self.base_scale = base_scale
@@ -95,6 +94,7 @@ class BasePCOptimizer (nn.Module):
 
         # possibly store images for show_pointcloud
         self.imgs = None
+        # 减少缓存？
         if 'img' in view1 and 'img' in view2:
             imgs = [torch.zeros((3,)+hw) for hw in self.imshapes]
             for v in range(len(self.edges)):
@@ -149,7 +149,7 @@ class BasePCOptimizer (nn.Module):
 
     def _get_poses(self, poses):
         # normalize rotation
-        Q = poses[:, :4]
+        Q = poses[:, :4] # 四元数表示旋转？
         T = signed_expm1(poses[:, 4:7])
         RT = roma.RigidUnitQuat(Q, T).normalize().to_homogeneous()
         return RT
@@ -273,11 +273,11 @@ class BasePCOptimizer (nn.Module):
         return loss
 
     @torch.cuda.amp.autocast(enabled=False)
-    def compute_global_alignment(self, init=None, niter_PnP=10, **kw):
+    def compute_global_alignment(self, init=None, niter_PnP=10, focal=None, pose_adjust_from_know=None, **kw):
         if init is None:
             pass
         elif init == 'msp' or init == 'mst':
-            init_fun.init_minimum_spanning_tree(self, niter_PnP=niter_PnP)
+            init_fun.init_minimum_spanning_tree(self, niter_PnP=niter_PnP, focal=focal, pose_adjust_from_know=pose_adjust_from_know)
         elif init == 'known_poses':
             init_fun.init_from_known_poses(self, min_conf_thr=self.min_conf_thr,
                                            niter_PnP=niter_PnP)
@@ -323,7 +323,21 @@ class BasePCOptimizer (nn.Module):
         return viz
 
 
-def global_alignment_loop(net, lr=0.01, niter=300, schedule='cosine', lr_min=1e-6):
+def global_alignment_loop(net, lr=0.01, niter=300, schedule='cosine', lr_min=1e-6, save_iterations=[i for i in range(0, 2000, 100)], save_path=None):
+
+    if save_path is None:
+        if os.getenv('OAR_JOB_ID'):
+            unique_str=os.getenv('OAR_JOB_ID')
+        else:
+            unique_str = str(uuid.uuid4())
+        save_path = os.path.join("./output/", unique_str[0:10])
+    
+    # Set up output folder
+    print("Output folder: {}".format(save_path))
+    os.makedirs(save_path, exist_ok = True)
+
+
+
     params = [p for p in net.parameters() if p.requires_grad]
     if not params:
         return net
@@ -340,12 +354,20 @@ def global_alignment_loop(net, lr=0.01, niter=300, schedule='cosine', lr_min=1e-
     if verbose:
         with tqdm.tqdm(total=niter) as bar:
             while bar.n < bar.total:
-                loss, lr = global_alignment_iter(net, bar.n, niter, lr_base, lr_min, optimizer, schedule)
-                bar.set_postfix_str(f'{lr=:g} loss={loss:g}')
+                loss, lr_cur = global_alignment_iter(net, bar.n, niter, lr_base, lr_min, optimizer, schedule)
+                bar.set_postfix_str(f'{lr_cur=:g} loss={loss:g}')
                 bar.update()
+
+                # add save checkpoint logic 
+                if bar.n in save_iterations:
+                    torch.save(net.state_dict(), os.path.join(save_path, f'ckpt_{bar.n}.pth'))
+
+            torch.save(net.state_dict(), os.path.join(save_path, 'ckpt_last.pth'))
+
+
     else:
         for n in range(niter):
-            loss, _ = global_alignment_iter(net, n, niter, lr_base, lr_min, optimizer, schedule)
+            loss = global_alignment_iter(net, n, niter, lr_base, lr_min, optimizer, schedule)
     return loss
 
 
@@ -362,9 +384,12 @@ def global_alignment_iter(net, cur_iter, niter, lr_base, lr_min, optimizer, sche
     loss = net()
     loss.backward()
     optimizer.step()
+    if hasattr(net, 'delta'):
+        # print('here')
+        net.update_trans()
+
 
     return float(loss), lr
-
 
 @torch.no_grad()
 def clean_pointcloud( im_confs, K, cams, depthmaps, all_pts3d, 

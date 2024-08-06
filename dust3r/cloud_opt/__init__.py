@@ -9,7 +9,8 @@ from enum import Enum
 from .optimizer import PointCloudOptimizer
 from .modular_optimizer import ModularPointCloudOptimizer
 from .pair_viewer import PairViewer
-
+from .base_opt import *
+from .init_im_poses import *
 
 class GlobalAlignerMode(Enum):
     PointCloudOptimizer = "PointCloudOptimizer"

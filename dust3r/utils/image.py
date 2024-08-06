@@ -92,7 +92,9 @@ def load_images(folder_or_list, size, square_ok=False, verbose=True):
     supported_images_extensions = tuple(supported_images_extensions)
 
     imgs = []
+    imgs_path = []
     for path in folder_content:
+        imgs_path.append(path)
         if not path.lower().endswith(supported_images_extensions):
             continue
         img = exif_transpose(PIL.Image.open(os.path.join(root, path))).convert('RGB')
@@ -123,4 +125,4 @@ def load_images(folder_or_list, size, square_ok=False, verbose=True):
     assert imgs, 'no images foud at '+root
     if verbose:
         print(f' (Found {len(imgs)} images)')
-    return imgs
+    return imgs, imgs_path
